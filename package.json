@@ -1,0 +1,24 @@
+{
+  "name": "trustvisor-verify-core",
+  "version": "1.2.1",
+  "description": "Ядро проверки подлинности файлов TrustVisor: разбор пакета, сверка подписи, цепочка аппаратной аттестации, вердикт.",
+  "type": "module",
+  "engines": {
+    "node": ">=22.6"
+  },
+  "scripts": {
+    "build": "tsc -p tsconfig.json",
+    "pretest": "npm run build",
+    "test": "node --test --experimental-strip-types src/**/*.test.ts"
+  },
+  "dependencies": {
+    "yauzl": "^3.1.0"
+  },
+  "devDependencies": {
+    "@types/node": "^22.0.0",
+    "@types/yauzl": "^2.10.3",
+    "typescript": "^5.5.0"
+  },
+  "license": "Apache-2.0",
+  "author": "ИП Савкин Михаил Андреевич"
+}

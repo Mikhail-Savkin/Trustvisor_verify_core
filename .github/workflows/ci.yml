@@ -1,0 +1,87 @@
+# Сборка и проверки на каждый push и pull request.
+#
+# Здесь намеренно нет ничего, кроме того, что можно повторить у себя одной
+# командой: смысл этого репозитория — воспроизводимость, и сборка не должна
+# знать секретов, ходить в наши сервисы или зависеть от чего-то, чего нет у
+# постороннего.
+name: Проверки
+
+on:
+  push:
+    branches: [main]
+  pull_request:
+
+jobs:
+  tests:
+    runs-on: ubuntu-latest
+    steps:
+      # Действия закреплены по хешу коммита, а не по метке. Метку владелец
+      # репозитория может незаметно перевести на другой код — так уже случалось
+      # с чужими действиями. Обновлять эти строки придётся руками, и это плата
+      # за то, что сборка не меняется под нами сама.
+      - uses: actions/checkout@11d5960a326750d5838078e36cf38b85af677262  # v4
+      - uses: actions/setup-node@49933ea5288caeca8642d1e84afbd3f7d6820020  # v4
+        with:
+          node-version: '22'
+
+      - run: npm ci
+
+      - name: Набор проверок ядра
+        run: npm test
+
+      # Пустой список отзыва молча выключил бы проверку ключей аттестации:
+      # «никто не отозван» и «мы не знаем» выглядят одинаково, если не
+      # смотреть. Поэтому снимок проверяется отдельно — что он есть, что он
+      # по формату Google и что дата проставлена.
+      - name: Снимок списка отзыва на месте
+        run: |
+          node --input-type=module -e '
+          import { REVOKED_SERIALS, REVOKED_SNAPSHOT_DATE } from "./dist/verify-core/revoked-keys.js";
+          const bad = [...REVOKED_SERIALS].filter((s) => !/^[a-f1-9][a-f0-9]*$/.test(s));
+          if (!REVOKED_SERIALS.size) { console.error("список отзыва пуст — проверка выключена"); process.exit(1); }
+          if (bad.length) { console.error("не по формату Google:", bad.slice(0, 3)); process.exit(1); }
+          if (!/^\d{4}-\d{2}-\d{2}$/.test(REVOKED_SNAPSHOT_DATE)) { console.error("нет даты снимка"); process.exit(1); }
+          console.log(`список отзыва: ${REVOKED_SERIALS.size} серийников, снимок от ${REVOKED_SNAPSHOT_DATE}`);
+          '
+
+      # Сквозная проверка тем же путём, которым пойдёт читатель: собрать
+      # производные образцы и прогнать по ним ту же команду, что описана в
+      # README. Коды возврата и есть проверка — 0 для подлинного файла, 1 для
+      # испорченного.
+      - name: Производные образцы
+        run: python3 samples/make_samples.py
+
+      - name: Подлинная съёмка проходит (формат 1.x)
+        run: node tools/verify.mjs samples/genuine-photo.trustvisor
+
+      # Формат 2.0 отдельной строкой: он новее и ответственнее, и молчаливо
+      # выпасть из проверок ему нельзя.
+      - name: Подлинная съёмка проходит (формат 2.0, фото и видео)
+        run: |
+          node tools/verify.mjs samples/genuine-2.0-photo.trustvisor
+          node tools/verify.mjs samples/genuine-2.0-video.trustvisor
+
+      - name: Изменённый файл не проходит
+        run: |
+          if node tools/verify.mjs samples/tampered.trustvisor; then
+            echo "изменённый файл признан подлинным — это поломка"
+            exit 1
+          fi
+
+      - name: Файл без аттестации не проходит
+        run: |
+          if node tools/verify.mjs samples/unattested.trustvisor; then
+            echo "файл без аттестации признан подлинным — это поломка"
+            exit 1
+          fi
+
+      # Набор перебора: три сотни порч одной настоящей съёмки. Раньше он был
+      # только ручным инструментом — fuzz_server печатает вердикты, и сверять
+      # их предлагалось глазами. Глаз в трёх сотнях строк одну изменившуюся не
+      # видит, а она и означает, что порча начала проходить. Правило описано в
+      # fuzz_check.mjs: подлинными вправе остаться только названные пересборки.
+      - name: Набор перебора не пропускает порчу
+        run: |
+          python3 tools/fuzz_gen.py samples/genuine-photo.trustvisor
+          node tools/fuzz_server.mjs tools/corpus > "$RUNNER_TEMP/verdicts.json"
+          node tools/fuzz_check.mjs "$RUNNER_TEMP/verdicts.json"

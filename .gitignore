@@ -1,0 +1,22 @@
+node_modules/
+dist/
+__pycache__/
+*.pyc
+
+# Рабочие наборы перебора — большие и порождаются заново
+corpus/
+corpus-divergence/
+_fz_*/
+corpus-media/
+corpus-media-video/
+
+# В samples/ входит ТОЛЬКО настоящая съёмка: без неё посторонний не запустит
+# ни положительные проверки, ни перебор. Производные образцы делает
+# samples/make_samples.py, и в репозитории они не нужны.
+samples/tampered.trustvisor
+samples/unattested.trustvisor
+
+# Резервные копии редакторов и скриптов правок: рядом с текущим ядром они
+# показывали бы его предыдущую редакцию.
+*.bak-*
+*.bak
