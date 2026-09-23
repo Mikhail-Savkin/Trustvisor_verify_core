@@ -40,6 +40,8 @@ import {
   checkLocationMock,
   checkLocationSecondOpinion,
   checkGnssPortrait,
+  parseExifGps,
+  checkExifGps,
   parseDetachedJws,
   verifyDetachedJws,
   assertNoV1Fields,
@@ -1407,5 +1409,133 @@ describe("Журнал датчиков", () => {
     assert.equal(r.state, "pass");
     assert.equal(r.truncated, true);
     assert.match(String(r.msg), /по объёму/);
+  });
+});
+
+/* ── Координаты в свойствах снимка ─────────────────────────────────────────
+   Приложение пишет место не только в манифест, но и в сам снимок: правила
+   страхования требуют «метаданные файла», и эксперт смотрит именно туда.
+   Запись идёт до хэширования, поэтому подпись её покрывает — а значит две
+   записи о месте обязаны сходиться, и расхождение мы обязаны заметить сами.
+
+   Снимки строятся здесь же: читателю видно, на чём проверено. */
+function makeExifJpeg(lat: number, lon: number, bigEndian = false): Uint8Array {
+  const tiff = new Uint8Array(128);
+  const dv = new DataView(tiff.buffer);
+  const le = !bigEndian;
+  let p = 0;
+  const b1 = (v: number) => { tiff[p++] = v; };
+  const b2 = (v: number) => { dv.setUint16(p, v, le); p += 2; };
+  const b4 = (v: number) => { dv.setUint32(p, v, le); p += 4; };
+  const rational = (n: number, d: number) => { b4(n); b4(d); };
+  const degrees = (v: number) => {
+    const a = Math.abs(v);
+    const d = Math.floor(a);
+    const mf = (a - d) * 60;
+    const m = Math.floor(mf);
+    rational(d, 1); rational(m, 1); rational(Math.round((mf - m) * 60 * 1000), 1000);
+  };
+
+  const GPS_IFD_OFF = 26;    // сразу за IFD0: 8 + (2 + 12 + 4)
+  const DATA_OFF = 80;       // сразу за GPS IFD: 26 + (2 + 48 + 4)
+
+  b1(bigEndian ? 0x4d : 0x49); b1(bigEndian ? 0x4d : 0x49);
+  b2(42); b4(8);
+  b2(1); b2(0x8825); b2(4); b4(1); b4(GPS_IFD_OFF); b4(0);
+  b2(4);
+  b2(1); b2(2); b4(2); b1(lat >= 0 ? 0x4e : 0x53); b1(0); b1(0); b1(0);
+  b2(2); b2(5); b4(3); b4(DATA_OFF);
+  b2(3); b2(2); b4(2); b1(lon >= 0 ? 0x45 : 0x57); b1(0); b1(0); b1(0);
+  b2(4); b2(5); b4(3); b4(DATA_OFF + 24);
+  b4(0);
+  degrees(lat); degrees(lon);
+
+  const body = tiff.slice(0, p);
+  const app1 = new Uint8Array(6 + body.length);
+  app1.set([0x45, 0x78, 0x69, 0x66, 0, 0]);
+  app1.set(body, 6);
+  const segLen = app1.length + 2;
+  const out = new Uint8Array(2 + 4 + app1.length + 4 + 2);
+  let q = 0;
+  out[q++] = 0xff; out[q++] = 0xd8;
+  out[q++] = 0xff; out[q++] = 0xe1;
+  out[q++] = (segLen >> 8) & 0xff; out[q++] = segLen & 0xff;
+  out.set(app1, q); q += app1.length;
+  out[q++] = 0xff; out[q++] = 0xda; out[q++] = 0x00; out[q++] = 0x02;
+  out[q++] = 0xff; out[q++] = 0xd9;
+  return out;
+}
+
+const МОСКВА = { lat: 55.751244, lon: 37.618423 };
+
+describe("Координаты в свойствах снимка", () => {
+  test("читаются при обоих порядках байтов", () => {
+    for (const big of [false, true]) {
+      const r = parseExifGps(makeExifJpeg(МОСКВА.lat, МОСКВА.lon, big));
+      assert.ok(r, "координаты не прочитались, big-endian=" + big);
+      assert.ok(Math.abs(r.latitude - МОСКВА.lat) < 1e-5);
+      assert.ok(Math.abs(r.longitude - МОСКВА.lon) < 1e-5);
+    }
+  });
+
+  test("южное и западное полушария не теряют знак", () => {
+    const рио = parseExifGps(makeExifJpeg(-22.906847, -43.172896));
+    assert.ok(рио);
+    assert.ok(рио.latitude < 0 && рио.longitude < 0, "знак потерян: " + JSON.stringify(рио));
+    const сидней = parseExifGps(makeExifJpeg(-33.868820, 151.209290));
+    assert.ok(сидней);
+    assert.ok(сидней.latitude < 0 && сидней.longitude > 0);
+  });
+
+  test("негодное даёт «координат нет», а не исключение", () => {
+    /* Проверка приводит довод; ронять из-за неё разбор целого файла нельзя. */
+    assert.equal(parseExifGps(new Uint8Array([0xff, 0xd8, 0xff, 0xda, 0x00, 0x02, 0xff, 0xd9])), null);
+    assert.equal(parseExifGps(makeExifJpeg(МОСКВА.lat, МОСКВА.lon).slice(0, 40)), null);
+    assert.equal(parseExifGps(new Uint8Array([0x89, 0x50, 0x4e, 0x47])), null);
+  });
+
+  test("чужой файл с настоящим EXIF внутри не считается снимком", () => {
+    /* Отсекается только проверкой первых байтов: дальше по файлу всё выглядит
+       как JPEG. Без неё координаты прочитались бы из того, что JPEG-ом не
+       является. */
+    const b = makeExifJpeg(МОСКВА.lat, МОСКВА.lon);
+    b[0] = 0x89; b[1] = 0x50;
+    assert.equal(parseExifGps(b), null);
+  });
+
+  test("дробь с нулём в знаменателе не даёт бесконечности", () => {
+    const b = makeExifJpeg(МОСКВА.lat, МОСКВА.lon);
+    b[110] = 0; b[111] = 0; b[112] = 0; b[113] = 0;
+    assert.equal(parseExifGps(b), null);
+  });
+
+  test("совпадение с подписанным — pass, расхождение — warn", () => {
+    const снимок = makeExifJpeg(МОСКВА.lat, МОСКВА.lon);
+    assert.equal(checkExifGps(снимок, { latitude: МОСКВА.lat, longitude: МОСКВА.lon }).state, "pass");
+    /* Полсотни метров — та же точка: в свойствах снимка координаты хранятся
+       округлённо, в манифесте полностью. Допуск про согласованность двух
+       записей, а не про точность прибора. */
+    assert.equal(checkExifGps(снимок, { latitude: МОСКВА.lat + 0.00045, longitude: МОСКВА.lon }).state, "pass");
+    assert.equal(checkExifGps(снимок, { latitude: МОСКВА.lat + 0.018, longitude: МОСКВА.lon }).state, "warn");
+    /* Перепутанные местами широта и долгота — самая частая ошибка в чужом
+       коде, и именно её проверка обязана поймать. */
+    assert.equal(checkExifGps(снимок, { latitude: МОСКВА.lon, longitude: МОСКВА.lat }).state, "warn");
+  });
+
+  test("старый снимок без координат проверку пропускает, а не валит", () => {
+    /* Так снимали до сентября 2026. Ругаться на такие файлы значило бы
+       объявить непригодным всё, что снято раньше. */
+    const без = new Uint8Array([0xff, 0xd8, 0xff, 0xda, 0x00, 0x02, 0xff, 0xd9]);
+    assert.equal(checkExifGps(без, { latitude: МОСКВА.lat, longitude: МОСКВА.lon }).state, "skip");
+    assert.equal(checkExifGps(undefined, { latitude: МОСКВА.lat, longitude: МОСКВА.lon }).state, "skip");
+  });
+
+  test("расхождение — замечание, вердикт оно не понижает", () => {
+    /* Подменить свойства снимка после съёмки нельзя — подпись покрывает весь
+       файл. Значит расхождение может вызвать только наша ошибка при записи
+       копии в EXIF, и платить за неё понижением вердикта клиент не должен. */
+    const r = downgradeReasonsOf({ exifGps: { state: "warn", msg: "" } } as never);
+    assert.ok(!r.includes("exifGps"), "расхождение координат не должно понижать вердикт");
+    assert.equal(r.length, 0, "одно расхождение координат не даёт никакой причины понижения");
   });
 });

@@ -17,7 +17,7 @@
 // туда попадает, только если проверка сочла его подлинным. «Портал» — сервер,
 // который эту проверку выполняет.
 import type { webcrypto } from "node:crypto";
-import { GOOGLE_ROOT_FINGERPRINTS_HARDCODED, OEM_ROOT_FINGERPRINTS, TRUSTVISOR_ATTESTATION_PUBLIC_KEY_B64 } from "./trusted-roots.js";
+import { GOOGLE_ROOT_FINGERPRINTS_HARDCODED, OEM_ROOT_FINGERPRINTS, TRUSTVISOR_ATTESTATION_PUBLIC_KEY_B64, TRUSTVISOR_WEB_SIGNING_KEYS } from "./trusted-roots.js";
 import { REVOKED_SERIALS, REVOKED_SNAPSHOT_DATE } from "./revoked-keys.js";
 import { PackageRejectedError } from "./errors.js";
 export { PackageRejectedError } from "./errors.js";
@@ -213,12 +213,20 @@ const JWS_SIG_CHARS = 86;
    Нулевым младшим битам соответствуют ровно эти четыре символа. Замерено. */
 const JWS_SIG_TAIL = new Set(["A", "Q", "g", "w"]);
 const JWS_HEADER_KEYS = ["alg", "b64", "crit", "typ", "x5c"];
+/* Второй допустимый набор — подпись сервера для съёмки из браузера. Именно
+   НАБОР, а не «x5c необязателен»: пакет обязан быть либо тем, либо другим, и
+   смешать их нельзя. Заголовок целиком под подписью. */
+const JWS_HEADER_KEYS_KID = ["alg", "b64", "crit", "kid", "typ"];
 const JWS_TYP = "application/trustvisor-manifest+json";
 
 export interface DetachedJws {
   protectedB64: string;
   signature: Uint8Array;
+  /* Пусто у браузерной съёмки: цепочки аттестации там нет и быть не может. */
   x5c: string[];
+  /* Заполнено только у подписи сервера. Взаимоисключающе с x5c: набор полей
+     заголовка проверяется целиком, третьего варианта нет. */
+  kid?: string;
 }
 
 /* Строгий разбор base64url. Отдельной функцией и намеренно: base64ToBytes
@@ -274,7 +282,9 @@ export function parseDetachedJws(bytes: Uint8Array): DetachedJws {
      подлинности; см. раздел 2.0.8 спецификации. Отсюда и текст ошибки:
      «не наш пакет», а не «изменён». */
   const keys = Object.keys(header).sort();
-  if (keys.join(",") !== JWS_HEADER_KEYS.join(",")) {
+  const withX5c = keys.join(",") === JWS_HEADER_KEYS.join(",");
+  const withKid = keys.join(",") === JWS_HEADER_KEYS_KID.join(",");
+  if (!withX5c && !withKid) {
     throw new Error("Заголовок подписи содержит не тот набор полей — это не пакет TrustVisor");
   }
   /* `alg` сверяется ДО того, как по нему что-либо выбирается: иначе
@@ -288,6 +298,19 @@ export function parseDetachedJws(bytes: Uint8Array): DetachedJws {
     throw new Error("Поле crit обязано быть [\"b64\"]");
   }
   if (header.typ !== JWS_TYP) throw new Error("Тип подписи не наш");
+  if (withKid) {
+    const kid = header.kid;
+    if (typeof kid !== "string" || !kid.length || kid.length > 64 || !/^[A-Za-z0-9._-]+$/.test(kid)) {
+      throw new Error("Имя ключа подписи (kid) пусто или недопустимо");
+    }
+    /* Неизвестный kid отвергаем ЗДЕСЬ, а не молчаливой неудачей подписи:
+       иначе «мы не знаем такого ключа» и «подпись не сошлась» слились бы в
+       один вердикт ИЗМЕНЁН, и разобраться было бы нечем. */
+    if (!Object.prototype.hasOwnProperty.call(TRUSTVISOR_WEB_SIGNING_KEYS, kid)) {
+      throw new Error("Подпись сделана неизвестным нам ключом: " + kid);
+    }
+    return { protectedB64, signature: base64UrlToBytes(sigB64), x5c: [], kid };
+  }
   const x5c = header.x5c;
   if (!Array.isArray(x5c) || x5c.length === 0
       || x5c.some((c) => typeof c !== "string" || c.length === 0)) {
@@ -1270,6 +1293,160 @@ export async function verifyAttestationChain(chainB64: string[]): Promise<boolea
 //
 // Эта проверка отвечает ровно на один вопрос — где живёт ключ. Утверждение
 // более узкое, но зато честное.
+/** Координаты из EXIF снимка, если они там есть. */
+export interface ExifGps {
+  latitude: number;
+  longitude: number;
+}
+
+/* Скупой разбор GPS из EXIF в JPEG. Нужны ровно четыре тега, поэтому своё, а
+   не библиотека: проверяльщик работает офлайн и живёт в двух копиях, одна из
+   которых переносится руками.
+
+   Любая неожиданность — возвращаем null («EXIF нет»), а не бросаем: эта
+   проверка приводит довод, и ронять из-за неё разбор целого файла нельзя. */
+export function parseExifGps(bytes: Uint8Array): ExifGps | null {
+  try {
+    if (bytes.length < 4 || bytes[0] !== 0xff || bytes[1] !== 0xd8) return null;  // не JPEG
+    /* Ищем сегмент APP1 с меткой "Exif\0\0". Идём по сегментам, а не поиском
+       подстроки: подстрока нашлась бы и внутри пикселей. */
+    let p = 2;
+    let tiff = -1;
+    while (p + 4 <= bytes.length) {
+      if (bytes[p] !== 0xff) return null;
+      const marker = bytes[p + 1];
+      if (marker === 0xda || marker === 0xd9) break;            // начались данные
+      const len = (bytes[p + 2] << 8) | bytes[p + 3];
+      if (len < 2 || p + 2 + len > bytes.length) return null;
+      if (marker === 0xe1 && len >= 8
+          && bytes[p + 4] === 0x45 && bytes[p + 5] === 0x78
+          && bytes[p + 6] === 0x69 && bytes[p + 7] === 0x66) {
+        tiff = p + 10;
+        break;
+      }
+      p += 2 + len;
+    }
+    if (tiff < 0 || tiff + 8 > bytes.length) return null;
+
+    const le = bytes[tiff] === 0x49 && bytes[tiff + 1] === 0x49;   // "II" или "MM"
+    const u16 = (o: number) => le ? bytes[o] | (bytes[o + 1] << 8)
+                                  : (bytes[o] << 8) | bytes[o + 1];
+    const u32 = (o: number) => (le
+      ? (bytes[o] | (bytes[o + 1] << 8) | (bytes[o + 2] << 16) | (bytes[o + 3] << 24))
+      : ((bytes[o] << 24) | (bytes[o + 1] << 16) | (bytes[o + 2] << 8) | bytes[o + 3])) >>> 0;
+    if (u16(tiff + 2) !== 0x002a) return null;
+
+    /* IFD0 → указатель на GPS-подкаталог (тег 0x8825). */
+    const ifd0 = tiff + u32(tiff + 4);
+    if (ifd0 + 2 > bytes.length) return null;
+    let gpsIfd = -1;
+    const n0 = u16(ifd0);
+    for (let i = 0; i < n0; i++) {
+      const e = ifd0 + 2 + i * 12;
+      if (e + 12 > bytes.length) return null;
+      if (u16(e) === 0x8825) { gpsIfd = tiff + u32(e + 8); break; }
+    }
+    if (gpsIfd < 0 || gpsIfd + 2 > bytes.length) return null;
+
+    /* В GPS-подкаталоге берём широту, долготу и их полушария. */
+    const rational3 = (off: number): number | null => {
+      let v = 0;
+      for (let k = 0; k < 3; k++) {
+        const num = u32(off + k * 8), den = u32(off + k * 8 + 4);
+        if (!den) return null;
+        v += (num / den) / Math.pow(60, k);
+      }
+      return v;
+    };
+    let lat: number | null = null, lon: number | null = null;
+    let latRef = "", lonRef = "";
+    const n = u16(gpsIfd);
+    for (let i = 0; i < n; i++) {
+      const e = gpsIfd + 2 + i * 12;
+      if (e + 12 > bytes.length) return null;
+      const tag = u16(e), count = u32(e + 4);
+      if (tag === 1 || tag === 3) {
+        /* Полушарие — одна буква, лежит прямо в поле значения. */
+        const c = String.fromCharCode(bytes[e + 8]);
+        if (tag === 1) latRef = c; else lonRef = c;
+      } else if ((tag === 2 || tag === 4) && count === 3) {
+        const off = tiff + u32(e + 8);
+        if (off + 24 > bytes.length) return null;
+        const v = rational3(off);
+        if (v === null) return null;
+        if (tag === 2) lat = v; else lon = v;
+      }
+    }
+    if (lat === null || lon === null) return null;
+    if (latRef === "S") lat = -lat;
+    if (lonRef === "W") lon = -lon;
+    if (!Number.isFinite(lat) || !Number.isFinite(lon)) return null;
+    if (Math.abs(lat) > 90 || Math.abs(lon) > 180) return null;
+    return { latitude: lat, longitude: lon };
+  } catch {
+    return null;
+  }
+}
+
+/* Расстояние между двумя точками, метры. Формула гаверсинуса: на наших
+   расстояниях плоская прикидка тоже сошлась бы, но у полюсов врала бы. */
+function metersBetween(aLat: number, aLon: number, bLat: number, bLon: number): number {
+  const R = 6371000, rad = Math.PI / 180;
+  const dLat = (bLat - aLat) * rad, dLon = (bLon - aLon) * rad;
+  const s = Math.sin(dLat / 2) ** 2
+    + Math.cos(aLat * rad) * Math.cos(bLat * rad) * Math.sin(dLon / 2) ** 2;
+  return 2 * R * Math.asin(Math.min(1, Math.sqrt(s)));
+}
+
+/* Двести метров. EXIF хранит координаты округлёнными до долей секунды, а
+   манифест несёт полное число, поэтому расхождение в сантиметры неизбежно.
+   Допуск НЕ про точность фикса — он про согласованность двух записей об одном
+   событии. */
+const EXIF_GPS_TOLERANCE_M = 200;
+
+/**
+ * Совпадают ли координаты в EXIF с подписанными.
+ *
+ * Довод, а не запрет: подменить EXIF после съёмки нельзя — подпись покрывает
+ * весь файл. Поэтому расхождение означает не подделку, а нашу собственную
+ * ошибку при записи копии в EXIF. Показывается замечанием; вердикт не трогает —
+ * наказывать клиента за наш промах нельзя. Верны координаты из подписанного
+ * описания: их записал проверенный путь приложения, и их показывает отчёт.
+ */
+export function checkExifGps(
+  photoBytes: Uint8Array | undefined,
+  manifest: Record<string, unknown>,
+): NamedCheck {
+  if (!photoBytes) return { state: "skip", msg: "EXIF: кадра нет" };
+  const exif = parseExifGps(photoBytes);
+  if (!exif) {
+    return { state: "skip", msg: "В снимке нет координат EXIF — так снимали до сентября 2026" };
+  }
+  const mLat = manifest.latitude, mLon = manifest.longitude;
+  if (typeof mLat !== "number" || typeof mLon !== "number") {
+    return {
+      state: "warn",
+      msg: "В снимке есть координаты EXIF, но в подписанном манифесте места нет",
+    };
+  }
+  const d = metersBetween(mLat, mLon, exif.latitude, exif.longitude);
+  if (d <= EXIF_GPS_TOLERANCE_M) {
+    return {
+      state: "pass",
+      exifLat: exif.latitude,
+      exifLon: exif.longitude,
+      msg: "Координаты в EXIF снимка совпадают с подписанными — и само совпадение под подписью",
+    };
+  }
+  return {
+    state: "warn",
+    exifLat: exif.latitude,
+    exifLon: exif.longitude,
+    msg: "Координаты в EXIF снимка расходятся с подписанными на "
+      + (d >= 1000 ? Math.round(d / 100) / 10 + " км" : Math.round(d) + " м"),
+  };
+}
+
 export function checkOid(attOk: boolean, attChain: string[] | undefined, refTsMs?: number | null): NamedCheck {
   if (!attOk || !attChain || !attChain.length) return { state: "skip", msg: "OID — аттестация отсутствует или не прошла" };
   let ext: KeyDescription | null = null;
@@ -1368,6 +1545,27 @@ export function checkOid(attOk: boolean, attChain: string[] | undefined, refTsMs
 
    Снимок списка — с датой, и дата уходит в текст: человек должен знать, на
    какое число мы отвечаем. Сервер сверяется с живым списком отдельно. */
+/* Одно и то же число Google публикует в списке отзыва ДВУМЯ видами: новые
+   ключи шестнадцатеричным, старые — десятичным. На 18.09.2026 из 1753 записей
+   977 десятичные (19–20 цифр), и сверка одной лишь hex-формой не находила ни
+   одну из них: отозванный ключ проходил как подлинный.
+
+   Список при этом нормализовать НЕЛЬЗЯ: строка из одних цифр неоднозначна —
+   «12345678» бывает и десятичной записью, и шестнадцатеричной, — и перегнав
+   её, мы сломали бы те записи, что были настоящим hex. Поэтому нормализуем
+   запрос: отдаём обе формы и ищем любую. Совпадений только прибавляется,
+   прежние не теряются. */
+export function serialLookupForms(serialHex: string): string[] {
+  const forms = [serialHex];
+  try {
+    const dec = BigInt("0x" + serialHex).toString(10);
+    if (dec !== serialHex) forms.push(dec);
+  } catch {
+    /* серийник не разобрался как число — остаётся одна hex-форма */
+  }
+  return forms;
+}
+
 export function checkAttestationRevoked(
   attOk: boolean,
   attChain: string[] | undefined,
@@ -1393,7 +1591,10 @@ export function checkAttestationRevoked(
     }
     if (!meta.serialHex) continue;
     seen++;
-    if (revoked.has(meta.serialHex)) hit.push(meta.serialHex);
+    /* Показываем всегда hex — это каноническая запись серийника сертификата,
+       даже когда совпала десятичная форма из списка. */
+    if (serialLookupForms(meta.serialHex).some((f) => revoked.has(f)))
+      hit.push(meta.serialHex);
   }
   if (!seen) return { state: "skip", msg: "Отзыв ключа: серийные номера цепочки не разобрались" };
   if (hit.length)
@@ -1766,6 +1967,10 @@ export function downgradeReasonsOf(c: Record<string, CheckValue>): string[] {
   if (_st(c, "revoked") === "warn") r.push("revoked");
   if (_st(c, "keybound") === "warn") r.push("keybound");
   if (_st(c, "motion") === "warn") r.push("motion");
+  /* exifGps здесь НЕТ намеренно. Подпись покрывает и описание, и EXIF, так что
+     расхождение может вызвать только наша ошибка при записи копии, — и за неё
+     не должен платить клиент понижением вердикта в своём споре. Расхождение
+     видно отдельной строкой проверки. Решение владельца, 23.09.2026. */
   if (_st(c, "challengeFreshness") === "warn") r.push("challengeFreshness");
   if (_st(c, "serverClock") === "warn") r.push("serverClock");
   if (_st(c, "deviceClock") === "warn" && (c.deviceClock as { downgrade?: boolean }).downgrade) r.push("deviceClock");
@@ -1937,6 +2142,23 @@ export async function verifyPackage(entries: PackageEntries, opts?: VerifyOption
       }
     }
     result.formatError = jwsError;
+    /* Подпись сервера: ключ берётся из закреплённого списка, а не из
+       манифеста. Манифест обязан объявлять ТОТ ЖЕ ключ — иначе файл говорит о
+       себе одно, а подписан другим, и читать его дальше незачем. */
+    if (jws && jws.kid) {
+      const pinned = TRUSTVISOR_WEB_SIGNING_KEYS[jws.kid];
+      if (pubKeyB64 !== pinned) {
+        result.checks.pubkey = false;
+        result.allPass = false;
+        pubKey = null;
+      } else {
+        try {
+          pubKey = await importSpkiKey(pinned);
+        } catch {
+          pubKey = null;
+        }
+      }
+    }
     let sigOk = false;
     if (pubKey && !jwsError) {
       try {
@@ -1994,6 +2216,10 @@ export async function verifyPackage(entries: PackageEntries, opts?: VerifyOption
       result.checks.hash = photoHex === expectedHash.toLowerCase();
       if (!result.checks.hash) result.allPass = false;
     }
+    /* Сверка EXIF с подписанным. Довод для того, кто привык смотреть в EXIF:
+       он там теперь есть, он совпадает, и за совпадение ручается подпись. */
+    result.checks.exifGps = checkExifGps(
+      entries.photoBuffer ? new Uint8Array(entries.photoBuffer) : undefined, manifest);
     result.checks.sensorLog = await checkSensorLog(manifest, entries.sensorLogBytes);
     if (stateOf(result.checks.sensorLog) === "fail") result.allPass = false;
     result.sensorLogBytes = entries.sensorLogBytes;
