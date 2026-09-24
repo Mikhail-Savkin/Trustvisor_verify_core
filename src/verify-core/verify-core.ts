@@ -66,6 +66,9 @@ export interface VerifyResult {
   deviceClockShiftMs?: number | null;
   locationMock?: boolean;
   meta: unknown;
+  /* Байты медиа для показа. У видео, отпечаток которого посчитан при
+     чтении (PackageEntries.videoDigest), буфер пуст: байты остались в
+     файле, и показывающая сторона берёт их оттуда. */
   mediaBuffer: ArrayBuffer;
   mediaType: string;
   mediaName: string;
@@ -82,6 +85,18 @@ export interface PackageEntries {
   manifestStartJson?: string; // video path
   manifestEndJson?: string;
   videoBuffer?: ArrayBuffer;
+  /* Отпечаток видео, посчитанный разборщиком по ходу чтения (ядро 1.4.0).
+
+     Видео бывает до гигабайта, и держать его в памяти ради одного хэша
+     незачем: ядро смотрит на байты видео только чтобы посчитать SHA-256.
+     Разборщик прогоняет байты через хэш, пока читает файл, и отдаёт сюда
+     итог и число байт.
+
+     Заполнять это поле вправе ТОЛЬКО тот, кто сам прочитал байты видео.
+     Взять его из пакета или из манифеста — значит сверить манифест сам с
+     собой. Если переданы и буфер, и отпечаток, верим буферу: его хэш ядро
+     считает само. */
+  videoDigest?: { sha256Hex: string; size: number };
   /* СЫРЫЕ байты манифестов — именно они идут в проверку подписи.
 
      Строки выше остаются для JSON.parse и для показа полей в отчёте, но
@@ -2234,7 +2249,7 @@ export async function verifyPackage(entries: PackageEntries, opts?: VerifyOption
   } else {
     const startMan = manifestPair(entries.manifestStartJsonBytes, entries.manifestStartJson);
     const endMan = manifestPair(entries.manifestEndJsonBytes, entries.manifestEndJson);
-    if (!startMan.text || !endMan.text || !entries.videoBuffer)
+    if (!startMan.text || !endMan.text || (!entries.videoBuffer && !entries.videoDigest))
       throw new Error("Пакет не содержит manifest_start.json / manifest_end.json / video.mp4");
     let sm: Record<string, unknown>, em: Record<string, unknown>;
     try {
@@ -2268,7 +2283,13 @@ export async function verifyPackage(entries: PackageEntries, opts?: VerifyOption
         pubKey = null;
       }
     }
-    const videoHex = await sha256Bytes(entries.videoBuffer);
+    /* Хэш видео — либо своими силами по буферу, либо готовый от разборщика,
+       который считал его, пока читал файл (см. PackageEntries.videoDigest).
+       Отпечаток не того вида — не повод верить: он просто не сойдётся. */
+    const videoHex = entries.videoBuffer
+      ? await sha256Bytes(entries.videoBuffer)
+      : /^[0-9a-f]{64}$/.test(entries.videoDigest!.sha256Hex) ? entries.videoDigest!.sha256Hex : "";
+    const videoSize = entries.videoBuffer ? entries.videoBuffer.byteLength : entries.videoDigest!.size;
     /* Развилка форматов, как в ветке фото. Для видео ОБЕ подписи
        обязательны: нет одной, не сошлась одна — ИЗМЕНЁН. Разбор пакета к
        этому моменту уже отверг бы пакет с одной записью подписи, но
@@ -2358,7 +2379,7 @@ export async function verifyPackage(entries: PackageEntries, opts?: VerifyOption
     if (typeof expectedHash !== "string") {
       result.checks.hash = false;
       result.allPass = false;
-    } else if (entries.videoBuffer.byteLength === 0) {
+    } else if (videoSize === 0 || videoHex === "") {
       result.checks.hash = false;
       result.allPass = false;
     } else {
@@ -2375,7 +2396,7 @@ export async function verifyPackage(entries: PackageEntries, opts?: VerifyOption
     result.checks.durationCap = checkDurationCap(sm, em);
     result.downgradeReasons = downgradeReasonsOf(result.checks);
     result.trustDowngrade = result.downgradeReasons.length > 0;
-    result.mediaBuffer = entries.videoBuffer;
+    result.mediaBuffer = entries.videoBuffer ?? new ArrayBuffer(0);
     result.mediaType = "video/mp4";
     result.mediaName = "video.mp4";
   }

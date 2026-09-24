@@ -15,10 +15,12 @@
 import { strict as assert } from "node:assert";
 import { test, describe } from "node:test";
 import { createReadStream, existsSync, writeFileSync, unlinkSync, readFileSync } from "node:fs";
+import { open as openFile } from "node:fs/promises";
+import { open as openZip } from "yauzl";
 import { join } from "node:path";
 import { tmpdir } from "node:os";
 import { randomUUID, createHash, generateKeyPairSync, sign } from "node:crypto";
-import { crc32 } from "node:zlib";
+import { crc32, deflateRawSync } from "node:zlib";
 /* Импорт из dist, а не из src — намеренно: проверяем ровно тот код, который
    реально работает в проде. Заодно это единственный способ, который не
    спотыкается о цепочку .js-импортов внутри самих модулей при запуске из
@@ -123,6 +125,31 @@ async function extract(buf: Buffer, fileName = "x.trustvisor") {
   } finally {
     try { unlinkSync(src); } catch { /* уже удалён */ }
   }
+}
+
+/* Все записи архива как есть — чтобы пересобрать пакет с подменой. */
+function readZipAll(path: string): Promise<{ name: string; data: Buffer }[]> {
+  return new Promise((resolve, reject) => {
+    openZip(path, { lazyEntries: true }, (err, zf) => {
+      if (err || !zf) return reject(err);
+      const out: { name: string; data: Buffer }[] = [];
+      zf.on("error", reject);
+      zf.on("end", () => resolve(out));
+      zf.on("entry", (e) => {
+        zf.openReadStream(e, (err2, s) => {
+          if (err2 || !s) return reject(err2);
+          const chunks: Buffer[] = [];
+          s.on("data", (c) => chunks.push(c as Buffer));
+          s.on("end", () => {
+            out.push({ name: e.fileName, data: Buffer.concat(chunks) });
+            zf.readEntry();
+          });
+          s.on("error", reject);
+        });
+      });
+      zf.readEntry();
+    });
+  });
 }
 
 const TINY_MANIFEST = Buffer.from('{"a":1}', "utf-8");
@@ -394,12 +421,22 @@ describe("Настоящая видеосъёмка", { skip: haveVideo ? false 
   });
 
   test("изменённый байт видео ломает вердикт", async () => {
-    const entries = await extract(readFileSync(REAL_VIDEO));
-    const v = Buffer.from(entries.videoBuffer as ArrayBuffer);
-    v[Math.floor(v.length / 2)] ^= 0xff;
-    const r = await verifyPackage({ ...entries, videoBuffer: v.buffer.slice(
-      v.byteOffset, v.byteOffset + v.byteLength) as ArrayBuffer });
+    /* С ядра 1.4.0 видео в память не читается — байт подменяем в самом
+       пакете: пересобираем архив из тех же записей. Рядом та же пересборка
+       без подмены: она обязана пройти, иначе провал доказывал бы только то,
+       что пересборка что-то ломает. */
+    const all = await readZipAll(REAL_VIDEO);
+    const honest = await verifyPackage(await extract(buildZip(all)));
+    assert.equal(honest.allPass, true, "пересобранный без подмены пакет проходит");
+    const bad = all.map((e) => {
+      if (e.name !== "video.mp4") return e;
+      const v = Buffer.from(e.data);
+      v[Math.floor(v.length / 2)] ^= 0xff;
+      return { name: e.name, data: v };
+    });
+    const r = await verifyPackage(await extract(buildZip(bad)));
     assert.equal(r.allPass, false, "подмена байта обязана ломать проверку");
+    assert.equal(r.checks.hash, false, "и ломается именно сверка хэша видео");
   });
 
   test("время съёмки впереди часов проверяющего вердикт НЕ решает", async () => {
@@ -438,6 +475,327 @@ describe("Настоящая видеосъёмка", { skip: haveVideo ? false 
       manifestStartJsonBytes: new TextEncoder().encode(after),
     });
     assert.equal(r.allPass, false, "дописанное поле обязано ломать подпись");
+  });
+});
+
+
+/* ── Видео по частям (ядро 1.4.0) ─────────────────────────────────────────
+   Видео больше не читается в память: разборщик считает SHA-256 по ходу
+   чтения и отдаёт ядру отпечаток (videoDigest). Отсюда три вещи, которые
+   надо стеречь: отпечаток по частям равен отпечатку целиком; память не
+   растёт вслед за файлом; потолок — гигабайт, и он проверяется до чтения. */
+describe("Видео по частям", () => {
+  const MAGIC = Buffer.from("TVSR-TrustVisor1", "ascii");
+  const MiB = 1024 * 1024;
+  const be32 = (n: number) => {
+    const b = Buffer.alloc(4);
+    b.writeUInt32BE(n);
+    return b;
+  };
+  const sha = (b: Buffer) => createHash("sha256").update(b).digest("hex");
+  const FTYP = Buffer.concat([be32(16), Buffer.from("ftypisom", "ascii"), be32(0)]);
+
+  /* Блок подписи версии 1 (два манифеста) в боксе uuid. */
+  function sigBox(start: Buffer, end: Buffer): Buffer {
+    const payload = Buffer.concat([MAGIC, Buffer.from([1, 1]), be32(start.length), start,
+                                   be32(end.length), end]);
+    return Buffer.concat([be32(payload.length + 8), Buffer.from("uuid", "ascii"), payload]);
+  }
+
+  /* Кусок «видео» номер i: мегабайт, каждый со своим началом. */
+  const BASE = Buffer.alloc(MiB);
+  for (let i = 0; i < BASE.length; i += 1) BASE[i] = (i * 2654435761) >>> 24;
+  function chunk(i: number): Buffer {
+    const c = Buffer.from(BASE);
+    c.writeUInt32BE(i >>> 0, 0);
+    return c;
+  }
+
+  /* Пик памяти процесса, пока идёт работа. Сравниваем с тем, что было до:
+     прежний разбор держал видео целиком и ещё копию — рост был бы больше
+     самого файла. */
+  async function peakRssGrowth<T>(work: () => Promise<T>): Promise<{ value: T; growthMiB: number }> {
+    globalThis.gc?.();
+    const base = process.memoryUsage().rss;
+    let peak = base;
+    const timer = setInterval(() => { peak = Math.max(peak, process.memoryUsage().rss); }, 5);
+    try {
+      const value = await work();
+      peak = Math.max(peak, process.memoryUsage().rss);
+      return { value, growthMiB: (peak - base) / MiB };
+    } finally {
+      clearInterval(timer);
+    }
+  }
+
+  /* Архив на диске без сжатия, видео пишется кусками — в памяти теста его
+     тоже нет. Заголовок видео дописывается после данных: CRC известна
+     только в конце. */
+  async function writeBigZip(path: string, small: { name: string; data: Buffer }[], videoMiB: number) {
+    const fh = await openFile(path, "w");
+    const central: Buffer[] = [];
+    let offset = 0;
+    const h = createHash("sha256");
+    const put = async (b: Buffer, at?: number) => {
+      await fh.write(b, 0, b.length, at ?? offset);
+      if (at === undefined) offset += b.length;
+    };
+    const header = (name: Buffer, crc: number, size: number, at: number) => {
+      const lh = Buffer.alloc(30);
+      lh.writeUInt32LE(0x04034b50, 0); lh.writeUInt16LE(20, 4);
+      lh.writeUInt32LE(crc, 14); lh.writeUInt32LE(size, 18); lh.writeUInt32LE(size, 22);
+      lh.writeUInt16LE(name.length, 26);
+      const ch = Buffer.alloc(46);
+      ch.writeUInt32LE(0x02014b50, 0); ch.writeUInt16LE(20, 4); ch.writeUInt16LE(20, 6);
+      ch.writeUInt32LE(crc, 16); ch.writeUInt32LE(size, 20); ch.writeUInt32LE(size, 24);
+      ch.writeUInt16LE(name.length, 28); ch.writeUInt32LE(at, 42);
+      central.push(ch, name);
+      return lh;
+    };
+    try {
+      for (const { name, data } of small) {
+        const n = Buffer.from(name, "utf-8");
+        await put(Buffer.concat([header(n, crc32(data), data.length, offset), n, data]));
+      }
+      const vn = Buffer.from("video.mp4", "utf-8");
+      const at = offset;
+      offset += 30 + vn.length;
+      let crc = 0;
+      for (let i = 0; i < videoMiB; i += 1) {
+        const c = chunk(i);
+        crc = crc32(c, crc);
+        h.update(c);
+        await put(c);
+      }
+      await put(Buffer.concat([header(vn, crc, videoMiB * MiB, at), vn]), at);
+      const cd = Buffer.concat(central);
+      const eocd = Buffer.alloc(22);
+      eocd.writeUInt32LE(0x06054b50, 0);
+      eocd.writeUInt16LE(small.length + 1, 8); eocd.writeUInt16LE(small.length + 1, 10);
+      eocd.writeUInt32LE(cd.length, 12); eocd.writeUInt32LE(offset, 16);
+      await put(Buffer.concat([cd, eocd]));
+    } finally {
+      await fh.close();
+    }
+    return { sha256Hex: h.digest("hex"), size: videoMiB * MiB };
+  }
+
+  const tmpFile = (ext: string) => join(tmpdir(), "tv-big-" + randomUUID() + ext);
+  const M = Buffer.from('{"a":1}', "utf-8");
+
+  test("отпечаток по частям равен отпечатку целиком: настоящие съёмки", { skip: haveVideo ? false : "нет samples/genuine.trustvisor" }, async () => {
+    for (const path of [REAL_VIDEO, REAL_2_0_VIDEO].filter((p) => existsSync(p))) {
+      const all = await readZipAll(path);
+      const video = all.find((e) => e.name === "video.mp4")!.data;
+      const entries = await extract(readFileSync(path));
+      assert.equal(entries.videoBuffer, undefined, "видео в память больше не читается");
+      assert.deepEqual(entries.videoDigest, { sha256Hex: sha(video), size: video.length },
+        "отпечаток из архива обязан совпасть с отпечатком целиком: " + path);
+      /* Тот же ролик подписанным MP4 — второй путь разбора. */
+      const signed = Buffer.concat([video, sigBox(Buffer.from(entries.manifestStartJsonBytes!),
+                                                   Buffer.from(entries.manifestEndJsonBytes!))]);
+      const fromMp4 = await extract(signed, "real.mp4");
+      assert.deepEqual(fromMp4.videoDigest, entries.videoDigest, "и из подписанного MP4 — тот же");
+      if (!entries.manifestStartJwsBytes) {
+        const r = await verifyPackage(fromMp4);
+        assert.equal(r.allPass, true, "настоящая съёмка подписанным MP4 проходит: " + path);
+      }
+    }
+  });
+
+  test("бокс подписи в середине и 64-битный размер бокса", async () => {
+    /* Бокс может стоять где угодно среди верхних; «чистые» байты — файл без
+       него. Размер 1 означает 64-битный размер после типа. */
+    const payload = Buffer.alloc(3 * MiB + 7, 0x42);
+    const big = Buffer.alloc(16);
+    big.writeUInt32BE(1, 0); big.write("mdat", 4, "ascii");
+    big.writeBigUInt64BE(BigInt(16 + payload.length), 8);
+    const mdat = Buffer.concat([big, payload]);
+    const e = await extract(Buffer.concat([FTYP, sigBox(M, M), mdat]), "mid.mp4");
+    assert.deepEqual(e.videoDigest, { sha256Hex: sha(Buffer.concat([FTYP, mdat])),
+                                      size: FTYP.length + mdat.length });
+  });
+
+  test("бокс «до конца файла» (размер 0) прячет подпись — это обычный MP4", async () => {
+    const mdat0 = Buffer.concat([be32(0), Buffer.from("mdat", "ascii"), Buffer.alloc(1000, 1)]);
+    await assert.rejects(() => extract(Buffer.concat([FTYP, mdat0, sigBox(M, M)]), "z.mp4"),
+      (err: Error) => /обычный MP4 без подписи/.test(err.message));
+  });
+
+  test("миллион крошечных боксов — без миллиона чтений диска", async () => {
+    /* Обход боксов идёт через окно в мегабайт. Без окна каждый заголовок —
+       отдельное чтение, и такой файл занимал бы проверку надолго. */
+    const tiny = Buffer.alloc(8 * 1024 * 1024);
+    for (let o = 0; o < tiny.length; o += 8) { tiny.writeUInt32BE(8, o); tiny.write("free", o + 4, "ascii"); }
+    const t0 = Date.now();
+    const e = await extract(Buffer.concat([FTYP, tiny, sigBox(M, M)]), "tiny.mp4");
+    const ms = Date.now() - t0;
+    assert.equal(e.videoDigest!.size, FTYP.length + tiny.length);
+    assert.ok(ms < 1000, `разбор 1 млн боксов занял ${ms} мс`);
+  });
+
+  test("архив с видео 600 МБ: разбирается, память не растёт вслед за файлом", async () => {
+    const path = tmpFile(".trustvisor");
+    try {
+      const want = await writeBigZip(path, [
+        { name: "manifest_start.json", data: M },
+        { name: "manifest_end.json", data: M },
+      ], 600);
+      const { value: e, growthMiB } = await peakRssGrowth(() => extractPackageFromPath(path, "big.trustvisor"));
+      assert.deepEqual(e.videoDigest, want, "отпечаток по частям = отпечаток при записи");
+      assert.equal(e.videoBuffer, undefined);
+      assert.ok(growthMiB < 200, `память выросла на ${growthMiB.toFixed(0)} МБ при видео 600 МБ`);
+    } finally {
+      try { unlinkSync(path); } catch { /* уже удалён */ }
+    }
+  });
+
+  test("подписанный MP4 на 300 МБ: разбирается, память не растёт вслед за файлом", async () => {
+    const path = tmpFile(".mp4");
+    const fh = await openFile(path, "w");
+    const h = createHash("sha256");
+    const MB = 300;
+    try {
+      const mdatHead = Buffer.concat([be32(8 + MB * MiB), Buffer.from("mdat", "ascii")]);
+      for (const b of [FTYP, mdatHead]) { await fh.write(b); h.update(b); }
+      for (let i = 0; i < MB; i += 1) { const c = chunk(i); await fh.write(c); h.update(c); }
+      await fh.write(sigBox(M, M));
+    } finally {
+      await fh.close();
+    }
+    try {
+      const { value: e, growthMiB } = await peakRssGrowth(() => extractPackageFromPath(path, "big.mp4"));
+      assert.deepEqual(e.videoDigest, { sha256Hex: h.digest("hex"), size: 16 + 8 + MB * MiB });
+      assert.equal(e.manifestStartJson, '{"a":1}');
+      assert.ok(growthMiB < 200, `память выросла на ${growthMiB.toFixed(0)} МБ при видео 300 МБ`);
+    } finally {
+      try { unlinkSync(path); } catch { /* уже удалён */ }
+    }
+  });
+
+  test("подписанный MP4 больше гигабайта — отказ до чтения", async () => {
+    const path = tmpFile(".mp4");
+    const fh = await openFile(path, "w");
+    try {
+      await fh.write(FTYP);
+      await fh.truncate(1024 * MiB + 1);
+    } finally {
+      await fh.close();
+    }
+    try {
+      await assert.rejects(() => extractPackageFromPath(path, "huge.mp4"),
+        (err: Error) => err instanceof PackageRejectedError && /слишком большой/.test(err.message));
+    } finally {
+      try { unlinkSync(path); } catch { /* уже удалён */ }
+    }
+  });
+
+  test("видео в архиве объявлено больше гигабайта — отказ до чтения", async () => {
+    /* Размер берётся из оглавления, до распаковки. Подделываем его и в
+       локальном заголовке, и в оглавлении; сами данные — килобайт. */
+    const zip = buildZip([
+      { name: "manifest_start.json", data: M },
+      { name: "manifest_end.json", data: M },
+      { name: "video.mp4", data: Buffer.alloc(1024, 3) },
+    ]);
+    /* Запись объявлена сжатой: у несжатой yauzl сам сверяет два размера и
+       до нашего потолка разбор бы не дошёл. Данные не распаковываются —
+       отказ наступает раньше. */
+    const huge = 1024 * MiB + 1;
+    const lh = zip.indexOf(Buffer.from("video.mp4")) - 30;
+    zip.writeUInt16LE(8, lh + 8);
+    zip.writeUInt32LE(huge, lh + 22);
+    const ch = zip.lastIndexOf(Buffer.from("video.mp4")) - 46;
+    zip.writeUInt16LE(8, ch + 10);
+    zip.writeUInt32LE(huge, ch + 24);
+    await assert.rejects(() => extract(zip),
+      (err: Error) => err instanceof PackageRejectedError && /слишком большой/.test(err.message));
+  });
+
+  test("ядро: отпечаток не того вида не сходится, пустое видео — ИЗМЕНЁН", { skip: haveVideo ? false : "нет samples/genuine.trustvisor" }, async () => {
+    const entries = await extract(readFileSync(REAL_VIDEO));
+    const d = entries.videoDigest!;
+    const upper = await verifyPackage({ ...entries, videoDigest: { ...d, sha256Hex: d.sha256Hex.toUpperCase() } });
+    assert.equal(upper.checks.hash, false, "отпечаток не в строчном шестнадцатеричном виде не принимается");
+    const empty = await verifyPackage({ ...entries, videoDigest: { ...d, size: 0 } });
+    assert.equal(empty.checks.hash, false, "пустое видео не проходит");
+    const ok = await verifyPackage(entries);
+    assert.equal(ok.checks.hash, true);
+    assert.equal(ok.mediaBuffer.byteLength, 0, "байты видео остались в файле");
+  });
+});
+
+/* ── Карман после конца сжатых данных (правка 106) ────────────────────────
+   Распаковщик останавливается на конце потока deflate, а остаток записи
+   пропускал молча: 64 КБ произвольных байтов после конца сжатого видео давали
+   ПОДЛИННО (замер 23.09.2026). Правило: сжатые данные кончаются ровно на конце
+   записи, размер после распаковки — ровно объявленный. */
+describe("Карман после конца сжатых данных", () => {
+  /* Архив со сжатием (метод 8), без дескрипторов. junk — байты после конца
+     сжатого потока внутри записи; usize — ложь об исходном размере. */
+  function deflatedZip(entries: { name: string; data: Buffer; junk?: Buffer; usize?: number }[]): Buffer {
+    const locals: Buffer[] = [], central: Buffer[] = [];
+    let offset = 0;
+    for (const { name, data, junk, usize } of entries) {
+      const n = Buffer.from(name, "utf-8");
+      const comp = Buffer.concat([deflateRawSync(data), junk ?? Buffer.alloc(0)]);
+      const crc = crc32(data), u = usize ?? data.length;
+      const lh = Buffer.alloc(30);
+      lh.writeUInt32LE(0x04034b50, 0); lh.writeUInt16LE(20, 4); lh.writeUInt16LE(8, 8);
+      lh.writeUInt32LE(crc, 14); lh.writeUInt32LE(comp.length, 18); lh.writeUInt32LE(u, 22);
+      lh.writeUInt16LE(n.length, 26);
+      const ch = Buffer.alloc(46);
+      ch.writeUInt32LE(0x02014b50, 0); ch.writeUInt16LE(20, 4); ch.writeUInt16LE(20, 6); ch.writeUInt16LE(8, 10);
+      ch.writeUInt32LE(crc, 16); ch.writeUInt32LE(comp.length, 20); ch.writeUInt32LE(u, 24);
+      ch.writeUInt16LE(n.length, 28); ch.writeUInt32LE(offset, 42);
+      locals.push(lh, n, comp); central.push(ch, n);
+      offset += 30 + n.length + comp.length;
+    }
+    const cd = Buffer.concat(central), eocd = Buffer.alloc(22);
+    eocd.writeUInt32LE(0x06054b50, 0);
+    eocd.writeUInt16LE(entries.length, 8); eocd.writeUInt16LE(entries.length, 10);
+    eocd.writeUInt32LE(cd.length, 12); eocd.writeUInt32LE(offset, 16);
+    return Buffer.concat([...locals, cd, eocd]);
+  }
+  const JUNK = Buffer.alloc(64 * 1024, 0x41);
+  const skip = haveVideo ? false : "нет samples/genuine.trustvisor";
+
+  test("честный пакет со сжатием проходит", { skip }, async () => {
+    const all = await readZipAll(REAL_VIDEO);
+    const r = await verifyPackage(await extract(deflatedZip(all)));
+    assert.equal(r.allPass, true, "пересобранный со сжатием честный пакет обязан пройти");
+  });
+
+  test("байты после конца сжатого видео — отказ", { skip }, async () => {
+    const all = await readZipAll(REAL_VIDEO);
+    const zip = deflatedZip(all.map((e) => (e.name === "video.mp4" ? { ...e, junk: JUNK } : e)));
+    await assert.rejects(() => extract(zip), (e: Error) =>
+      e instanceof PackageRejectedError && /video\.mp4 есть лишние байты/.test(e.message));
+  });
+
+  test("байты после конца сжатого манифеста — отказ", { skip }, async () => {
+    const all = await readZipAll(REAL_VIDEO);
+    const zip = deflatedZip(all.map((e) => (e.name === "manifest_start.json" ? { ...e, junk: Buffer.from("POCKET") } : e)));
+    await assert.rejects(() => extract(zip), (e: Error) =>
+      e instanceof PackageRejectedError && /manifest_start\.json есть лишние байты/.test(e.message));
+  });
+
+  test("распаковалось больше объявленного — отказ, и дальше объявленного не распаковываем", { skip }, async () => {
+    const all = await readZipAll(REAL_VIDEO);
+    for (const name of ["video.mp4", "manifest_end.json"]) {
+      const zip = deflatedZip(all.map((e) => (e.name === name ? { ...e, usize: e.data.length - 1 } : e)));
+      await assert.rejects(() => extract(zip), (e: Error) =>
+        e instanceof PackageRejectedError && /после распаковки не совпадает/.test(e.message), name);
+    }
+  });
+
+  test("распаковалось меньше объявленного — отказ", { skip }, async () => {
+    const all = await readZipAll(REAL_VIDEO);
+    for (const name of ["video.mp4", "manifest_end.json"]) {
+      const zip = deflatedZip(all.map((e) => (e.name === name ? { ...e, usize: e.data.length + 1 } : e)));
+      await assert.rejects(() => extract(zip), (e: Error) =>
+        e instanceof PackageRejectedError && /после распаковки не совпадает/.test(e.message), name);
+    }
   });
 });
 

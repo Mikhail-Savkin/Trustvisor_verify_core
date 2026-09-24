@@ -7,15 +7,23 @@
 // как что-либо распаковано. Браузерная проверка берёт их из недокументированного
 // внутреннего поля библиотеки JSZip: во вкладке у одного человека это
 // допустимо, для открытой точки загрузки — нет.
-import { createWriteStream } from "node:fs";
-import { open, readFile, stat } from "node:fs/promises";
+import { createHash } from "node:crypto";
+import { createInflateRaw, inflateRawSync } from "node:zlib";
+import { createReadStream, createWriteStream } from "node:fs";
+import { open, readFile, stat, type FileHandle } from "node:fs/promises";
 
-// Подписанное медиа — MP4, PNG или JPEG — читается в память целиком: нужен и
-// вырез блока подписи, и хэш. Отсюда верхняя граница, иначе большой файл кладёт
-// процесс. Тот же потолок стоит и на запись внутри архива (см. проверку размера
-// при разборе): её содержимое тоже читается целиком, и правила не должны
-// расходиться.
+// Подписанное фото — PNG или JPEG — читается в память целиком: нужен и вырез
+// блока подписи, и хэш. Отсюда верхняя граница, иначе большой файл кладёт
+// процесс. Тот же потолок стоит и на фото внутри архива (см. проверку размера
+// при разборе): правила не должны расходиться.
 const MAX_SIGNED_MEDIA_BYTES = 256 * 1024 * 1024;
+/* Видео в память не читается (ядро 1.4.0). Ядру от его байтов нужен только
+   SHA-256, и разборщик считает его по ходу чтения: в памяти лежат лишь
+   манифесты и блок подписи. Поэтому и потолок другой — гигабайт: столько
+   принимает портал, и это около получаса съёмки в качестве HD.
+   До 1.4.0 видео читалось целиком и упиралось в те же 256 МБ, что и фото, —
+   это около семи минут, и приложению приходилось останавливать запись. */
+const MAX_STREAMED_VIDEO_BYTES = 1024 * 1024 * 1024;
 
 async function peekBytes(path: string, n: number): Promise<Buffer> {
   const fh = await open(path, "r");
@@ -28,8 +36,12 @@ async function peekBytes(path: string, n: number): Promise<Buffer> {
   }
 }
 
+function isMp4Magic(b: Buffer): boolean {
+  return b.length >= 8 && b[4] === 0x66 && b[5] === 0x74 && b[6] === 0x79 && b[7] === 0x70; // ftyp
+}
+
 function isSignedMediaMagic(b: Buffer): boolean {
-  if (b.length >= 8 && b[4] === 0x66 && b[5] === 0x74 && b[6] === 0x79 && b[7] === 0x70) return true; // ftyp
+  if (isMp4Magic(b)) return true;
   if (b.length >= 8 && b[0] === 0x89 && b[1] === 0x50 && b[2] === 0x4e && b[3] === 0x47) return true; // PNG
   if (b.length >= 3 && b[0] === 0xff && b[1] === 0xd8 && b[2] === 0xff) return true;                  // JPEG (SOI)
   return false;
@@ -84,7 +96,36 @@ function openZipFile(path: string): Promise<ZipFile> {
   });
 }
 
+/* Сжатая запись обязана кончаться ровно там, где кончается её сжатый поток
+   (правка 106). Распаковщики — zlib здесь, JSZip на сайте — останавливаются на
+   конце потока deflate, а остаток записи молча пропускают. Замерено 23.09.2026:
+   64 КБ произвольных байтов после конца сжатого видео давали ПОДЛИННО и здесь,
+   и на сайте. Подделкой содержимого это не было, но было карманом — как
+   закрытые раньше комментарии и промежутки между записями: байты лежат в
+   подлинном файле, подпись их не покрывает, никто их не видит.
+
+   Поэтому сжатые записи читаются сырыми и распаковываются своим zlib: он
+   сообщает, сколько сжатых байт съел (bytesWritten). Выход распаковки ограничен
+   объявленным размером — лживое оглавление не раздует память. */
+function deflateLeftover(entry: Entry): PackageRejectedError {
+  return new PackageRejectedError(`После конца сжатых данных записи ${entry.fileName} есть лишние байты`);
+}
+function deflateSizeMismatch(entry: Entry): PackageRejectedError {
+  return new PackageRejectedError(`Размер записи ${entry.fileName} после распаковки не совпадает с оглавлением`);
+}
+
+function openRawStream(zipfile: ZipFile, entry: Entry): Promise<NodeJS.ReadableStream> {
+  return new Promise((resolve, reject) => {
+    /* decompress: false — сырые сжатые байты ровно длиной записи по оглавлению. */
+    zipfile.openReadStream(entry, { decompress: false, decrypt: null, start: null, end: null }, (err, stream) => {
+      if (err || !stream) return reject(err ?? new Error("не удалось прочитать запись архива"));
+      resolve(stream);
+    });
+  });
+}
+
 function readEntryBuffer(zipfile: ZipFile, entry: Entry): Promise<Buffer> {
+  if (entry.compressionMethod === 8) return readDeflatedEntry(zipfile, entry);
   return new Promise((resolve, reject) => {
     zipfile.openReadStream(entry, (err, stream) => {
       if (err || !stream) return reject(err ?? new Error("не удалось прочитать запись архива"));
@@ -93,6 +134,86 @@ function readEntryBuffer(zipfile: ZipFile, entry: Entry): Promise<Buffer> {
       stream.on("end", () => resolve(Buffer.concat(chunks)));
       stream.on("error", reject);
     });
+  });
+}
+
+async function readDeflatedEntry(zipfile: ZipFile, entry: Entry): Promise<Buffer> {
+  const stream = await openRawStream(zipfile, entry);
+  const raw = await new Promise<Buffer>((resolve, reject) => {
+    const chunks: Buffer[] = [];
+    stream.on("data", (c) => chunks.push(c as Buffer));
+    stream.on("end", () => resolve(Buffer.concat(chunks)));
+    stream.on("error", reject);
+  });
+  type Inflated = { buffer: Buffer; engine: { bytesWritten: number } };
+  let out: Inflated;
+  try {
+    out = (inflateRawSync as unknown as (b: Buffer, o: object) => Inflated)(
+      raw, { info: true, maxOutputLength: entry.uncompressedSize + 1 });
+  } catch (e) {
+    if ((e as { code?: string }).code === "ERR_BUFFER_TOO_LARGE") throw deflateSizeMismatch(entry);
+    throw e;
+  }
+  if (out.engine.bytesWritten !== raw.length) throw deflateLeftover(entry);
+  if (out.buffer.length !== entry.uncompressedSize) throw deflateSizeMismatch(entry);
+  return out.buffer;
+}
+
+/* Запись архива — через SHA-256, не в память. Так читается только видео:
+   ядру от его байтов нужен лишь хэш (PackageEntries.videoDigest).
+   Строгость та же, что у чтения в буфер: у записи без сжатия yauzl сверяет
+   размер сам; сжатая распаковывается своим zlib с теми же правилами —
+   конец сжатого потока ровно на конце записи, размер ровно объявленный. */
+function hashEntryStream(zipfile: ZipFile, entry: Entry): Promise<{ sha256Hex: string; size: number }> {
+  if (entry.compressionMethod === 8) return hashDeflatedEntry(zipfile, entry);
+  return new Promise((resolve, reject) => {
+    zipfile.openReadStream(entry, (err, stream) => {
+      if (err || !stream) return reject(err ?? new Error("не удалось прочитать запись архива"));
+      const h = createHash("sha256");
+      let size = 0;
+      stream.on("data", (c) => {
+        h.update(c as Buffer);
+        size += (c as Buffer).length;
+      });
+      stream.on("end", () => resolve({ sha256Hex: h.digest("hex"), size }));
+      stream.on("error", reject);
+    });
+  });
+}
+
+async function hashDeflatedEntry(zipfile: ZipFile, entry: Entry): Promise<{ sha256Hex: string; size: number }> {
+  const raw = await openRawStream(zipfile, entry);
+  return new Promise((resolve, reject) => {
+    const inf = createInflateRaw();
+    const h = createHash("sha256");
+    let size = 0;
+    let done = false;
+    const fail = (e: unknown) => {
+      if (done) return;
+      done = true;
+      (raw as unknown as { unpipe?: (d: unknown) => void; destroy?: () => void }).unpipe?.(inf);
+      (raw as unknown as { destroy?: () => void }).destroy?.();
+      inf.destroy();
+      reject(e);
+    };
+    raw.on("error", fail);
+    inf.on("error", fail);
+    inf.on("data", (c: Buffer) => {
+      if (done) return;
+      size += c.length;
+      /* Больше объявленного — дальше не распаковываем: иначе объявленный в
+         оглавлении размер не значил бы ничего. */
+      if (size > entry.uncompressedSize) return fail(deflateSizeMismatch(entry));
+      h.update(c);
+    });
+    inf.on("end", () => {
+      if (done) return;
+      if (inf.bytesWritten !== entry.compressedSize) return fail(deflateLeftover(entry));
+      if (size !== entry.uncompressedSize) return fail(deflateSizeMismatch(entry));
+      done = true;
+      resolve({ sha256Hex: h.digest("hex"), size });
+    });
+    raw.pipe(inf);
   });
 }
 
@@ -154,60 +275,145 @@ function blockReader(buf: Buffer, start: number, end: number, where: string) {
   };
 }
 
-function tryParseSignedMp4(buf: Buffer, fileName: string): PackageEntries | null {
-  if (buf.length < 16) return null;
-  if (!(buf[4] === 0x66 && buf[5] === 0x74 && buf[6] === 0x79 && buf[7] === 0x70)) return null; // 'ftyp'
-  let off = 0;
-  while (off + 8 <= buf.length) {
-    let size = buf.readUInt32BE(off);
-    let hdr = 8;
-    const isUuid = buf[off + 4] === 0x75 && buf[off + 5] === 0x75 && buf[off + 6] === 0x69 && buf[off + 7] === 0x64;
-    if (size === 1) {
-      if (off + 16 > buf.length) break;
-      size = Number(buf.readBigUInt64BE(off + 8));
-      hdr = 16;
-    } else if (size === 0) {
-      size = buf.length - off;
-    }
-    if (size < hdr || off + size > buf.length) break; // повреждённая структура — пусть ответит общий путь
-    if (isUuid && size >= hdr + 16 + 2 + 8 && buf.subarray(off + hdr, off + hdr + 16).equals(SIGNED_MP4_UUID)) {
-      const p = off + hdr + 16;
-      const ver = buf[p];
-      if ((ver !== 1 && ver !== 2 && ver !== 3) || buf[p + 1] !== 1)
-        throw new PackageRejectedError("Неизвестная версия подписи в MP4 — обновите верификатор");
-      /* Формат 2.0: за каждым манифестом идёт его запись подписи. Порядок
-         полей тот же, что в архиве, и различаются форматы тем же признаком —
-         байтом версии. Откатиться некуда: версия 1 на новом файле уводит в
-         старое правило, которое требует отсутствующее поле `signature`. */
-      /* Версия 3 — то же, что 2, плюс журнал датчиков последней частью.
-         Отдельная версия, а не «часть нулевой длины»: два способа сказать
-         «журнала нет» — это два разбора и повод разойтись. Здесь способ
-         один, и он сверяется с манифестом в verify-core. */
-      const r = blockReader(buf, p + 2, off + size, "MP4");
-      const startB = r.take(r.u32(), MAX_MANIFEST_BYTES, "Манифест");
-      const startJws = ver >= 2 ? r.take(r.u32(), MAX_JWS_BYTES, "Запись подписи") : undefined;
-      const endB = r.take(r.u32(), MAX_MANIFEST_BYTES, "Манифест");
-      const endJws = ver >= 2 ? r.take(r.u32(), MAX_JWS_BYTES, "Запись подписи") : undefined;
-      const sensorLog = ver === 3 ? r.take(r.u32(), MAX_SENSOR_BYTES, "Журнал датчиков") : undefined;
-      r.requireEnd("После манифестов в блоке подписи MP4 остались лишние байты");
-      const clean = Buffer.concat([buf.subarray(0, off), buf.subarray(off + size)]);
-      return {
-        fileName,
-        manifestStartJson: startB.toString("utf-8"),
-        manifestEndJson: endB.toString("utf-8"),
-        manifestStartJsonBytes: new Uint8Array(startB),
-        manifestEndJsonBytes: new Uint8Array(endB),
-        manifestStartJwsBytes: startJws ? new Uint8Array(startJws) : undefined,
-        manifestEndJwsBytes: endJws ? new Uint8Array(endJws) : undefined,
-        sensorLogBytes: sensorLog ? new Uint8Array(sensorLog) : undefined,
-        videoBuffer: toArrayBuffer(clean),
-      };
-    }
-    off += size;
+/* Окно чтения файла по смещениям. Обход боксов MP4 читает по заголовку на
+   бокс; без окна файл из миллионов крошечных боксов превратил бы гигабайт в
+   миллионы системных вызовов. С окном — один запрос на мегабайт, почти как
+   прежний обход в памяти. Вызывающий сам следит, чтобы pos + n <= len. */
+const FILE_WINDOW_BYTES = 1024 * 1024;
+
+function fileWindow(fh: FileHandle, len: number) {
+  let wStart = 0;
+  let wBuf: Buffer = Buffer.alloc(0);
+  /* peek — без ожидания, когда байты уже в окне (почти всегда); at — с
+     чтением диска. Ожидание на каждый бокс стоило секунду с лишним на
+     миллион боксов — замерено; так обход идёт со скоростью прежнего. */
+  const peek = (pos: number, n: number): Buffer | null =>
+    pos >= wStart && pos + n <= wStart + wBuf.length ? wBuf.subarray(pos - wStart, pos - wStart + n) : null;
+  const at = async (pos: number, n: number): Promise<Buffer> => {
+    const hit = peek(pos, n);
+    if (hit) return hit;
+    wBuf = await readExact(fh, pos, Math.min(Math.max(n, FILE_WINDOW_BYTES), len - pos));
+    wStart = pos;
+    return wBuf.subarray(0, n);
+  };
+  return { peek, at };
+}
+
+async function readExact(fh: FileHandle, pos: number, n: number): Promise<Buffer> {
+  const b = Buffer.alloc(n);
+  let got = 0;
+  while (got < n) {
+    const { bytesRead } = await fh.read(b, got, n - got, pos + got);
+    if (bytesRead === 0) throw new PackageRejectedError("Файл изменился во время проверки");
+    got += bytesRead;
   }
-  throw new PackageRejectedError(
-    "Это обычный MP4 без подписи TrustVisor. Если файл переслали — вероятно, мессенджер пересжал его при отправке «как видео»: попросите отправить как файл/документ либо пришлите исходный .trustvisor.",
-  );
+  return b;
+}
+
+/* Больше этого блок подписи в MP4 быть не может: каждая часть ограничена
+   своим пределом, и читатель блока (blockReader) дальше не уйдёт. Потому и в
+   память берётся не больше — даже если бокс объявлен гигабайтным. Лишнее за
+   этой границей отвергается тем же requireEnd, что и раньше: концом блока
+   служит конец бокса, а не конец прочитанного. */
+const MAX_MP4_BLOCK_BYTES = 2 + 5 * 4 + 2 * MAX_MANIFEST_BYTES + 2 * MAX_JWS_BYTES + MAX_SENSOR_BYTES;
+
+/* SHA-256 файла без выреза [cutFrom, cutTo) — то есть MP4 без блока подписи.
+   Раньше для этого собиралась «чистая» копия в памяти. */
+async function sha256FileExcept(path: string, len: number, cutFrom: number, cutTo: number): Promise<{ sha256Hex: string; size: number }> {
+  const h = createHash("sha256");
+  let size = 0;
+  for (const [s, e] of [[0, cutFrom], [cutTo, len]]) {
+    if (e <= s) continue;
+    for await (const c of createReadStream(path, { start: s, end: e - 1, highWaterMark: FILE_WINDOW_BYTES })) {
+      h.update(c as Buffer);
+      size += (c as Buffer).length;
+    }
+  }
+  if (size !== len - (cutTo - cutFrom)) throw new PackageRejectedError("Файл изменился во время проверки");
+  return { sha256Hex: h.digest("hex"), size };
+}
+
+/* Подписанный MP4, прочитанный с диска по частям (ядро 1.4.0).
+
+   Правила разбора — ровно прежние, когда файл целиком лежал в памяти:
+   обход боксов верхнего уровня (размер 1 — 64-битный, 0 — до конца файла,
+   сломанная структура — выход из обхода), наш бокс узнаётся по метке,
+   блок разбирает тот же читатель с теми же текстами отказов. Разница
+   одна: байты видео не складываются в память, а идут в хэш.
+
+   Вызывается только для файла с меткой ftyp не короче 16 байт; на MP4 без
+   нашего бокса — вежливый отказ про пересжатие мессенджером (главный
+   жизненный случай провала). */
+async function parseSignedMp4File(path: string, len: number, fileName: string): Promise<PackageEntries> {
+  const fh = await open(path, "r");
+  let cut: { from: number; to: number } | null = null;
+  let parts: {
+    startB: Buffer; startJws?: Buffer; endB: Buffer; endJws?: Buffer; sensorLog?: Buffer;
+  } | null = null;
+  try {
+    const win = fileWindow(fh, len);
+    let off = 0;
+    while (off + 8 <= len) {
+      const k = Math.min(16, len - off);
+      const h = win.peek(off, k) ?? await win.at(off, k);
+      let size = h.readUInt32BE(0);
+      let hdr = 8;
+      const isUuid = h[4] === 0x75 && h[5] === 0x75 && h[6] === 0x69 && h[7] === 0x64;
+      if (size === 1) {
+        if (off + 16 > len) break;
+        size = Number(h.readBigUInt64BE(8));
+        hdr = 16;
+      } else if (size === 0) {
+        size = len - off;
+      }
+      if (size < hdr || off + size > len) break; // повреждённая структура — пусть ответит общий путь
+      if (isUuid && size >= hdr + 16 + 2 + 8 && (await win.at(off + hdr, 16)).equals(SIGNED_MP4_UUID)) {
+        const bodyStart = off + hdr + 16;
+        const bodyLen = off + size - bodyStart;
+        const body = await readExact(fh, bodyStart, Math.min(bodyLen, MAX_MP4_BLOCK_BYTES));
+        const ver = body[0];
+        if ((ver !== 1 && ver !== 2 && ver !== 3) || body[1] !== 1)
+          throw new PackageRejectedError("Неизвестная версия подписи в MP4 — обновите верификатор");
+        /* Формат 2.0: за каждым манифестом идёт его запись подписи. Порядок
+           полей тот же, что в архиве, и различаются форматы тем же признаком —
+           байтом версии. Откатиться некуда: версия 1 на новом файле уводит в
+           старое правило, которое требует отсутствующее поле `signature`. */
+        /* Версия 3 — то же, что 2, плюс журнал датчиков последней частью.
+           Отдельная версия, а не «часть нулевой длины»: два способа сказать
+           «журнала нет» — это два разбора и повод разойтись. Здесь способ
+           один, и он сверяется с манифестом в verify-core. */
+        const r = blockReader(body, 2, bodyLen, "MP4");
+        const startB = r.take(r.u32(), MAX_MANIFEST_BYTES, "Манифест");
+        const startJws = ver >= 2 ? r.take(r.u32(), MAX_JWS_BYTES, "Запись подписи") : undefined;
+        const endB = r.take(r.u32(), MAX_MANIFEST_BYTES, "Манифест");
+        const endJws = ver >= 2 ? r.take(r.u32(), MAX_JWS_BYTES, "Запись подписи") : undefined;
+        const sensorLog = ver === 3 ? r.take(r.u32(), MAX_SENSOR_BYTES, "Журнал датчиков") : undefined;
+        r.requireEnd("После манифестов в блоке подписи MP4 остались лишние байты");
+        parts = { startB, startJws, endB, endJws, sensorLog };
+        cut = { from: off, to: off + size };
+        break;
+      }
+      off += size;
+    }
+  } finally {
+    await fh.close();
+  }
+  if (!cut || !parts) {
+    throw new PackageRejectedError(
+      "Это обычный MP4 без подписи TrustVisor. Если файл переслали — вероятно, мессенджер пересжал его при отправке «как видео»: попросите отправить как файл/документ либо пришлите исходный .trustvisor.",
+    );
+  }
+  return {
+    fileName,
+    manifestStartJson: parts.startB.toString("utf-8"),
+    manifestEndJson: parts.endB.toString("utf-8"),
+    manifestStartJsonBytes: new Uint8Array(parts.startB),
+    manifestEndJsonBytes: new Uint8Array(parts.endB),
+    manifestStartJwsBytes: parts.startJws ? new Uint8Array(parts.startJws) : undefined,
+    manifestEndJwsBytes: parts.endJws ? new Uint8Array(parts.endJws) : undefined,
+    sensorLogBytes: parts.sensorLog ? new Uint8Array(parts.sensorLog) : undefined,
+    videoDigest: await sha256FileExcept(path, len, cut.from, cut.to),
+  };
 }
 
 /* Подписанный PNG: манифест в приватном чанке `tvSg` перед IEND.
@@ -363,7 +569,7 @@ async function readCentralDirectoryNames(path: string): Promise<{ declared: numb
     const cdOffset = tail.readUInt32LE(eocd + 16);
     if (declared === ZIP64_SENTINEL_16 || cdSize === ZIP64_SENTINEL_32 || cdOffset === ZIP64_SENTINEL_32) {
       /* ZIP64. Наши пакеты его не порождают никогда: до восьми записей,
-         медиа до 256 МБ. Поддерживать второй формат оглавления значит
+         видео до гигабайта (ZIP64 нужен начиная с 4 ГБ). Поддерживать второй формат оглавления значит
          завести второй разборщик и второй повод двум верификаторам
          разойтись — отвергаем в обоих одинаково. */
       throw new PackageRejectedError("Формат ZIP64 не поддерживается — настоящая съёмка его не создаёт");
@@ -646,11 +852,16 @@ export async function extractPackageFromPath(tempPath: string, fileName: string)
   // только в пределах лимита. Всё остальное (zip-пакеты) — потоковым путём.
   if (isMedia) {
     const { size } = await stat(tempPath);
+    /* Видео — по частям и до гигабайта; фото — в память и до 256 МБ.
+       MP4 короче 16 байт не разбирался и прежде — идёт общим путём. */
+    if (isMp4Magic(magic) && size >= 16) {
+      if (size > MAX_STREAMED_VIDEO_BYTES)
+        throw new PackageRejectedError("Файл слишком большой для подписанного MP4/PNG");
+      return await parseSignedMp4File(tempPath, size, fileName);
+    }
     if (size > MAX_SIGNED_MEDIA_BYTES)
       throw new PackageRejectedError("Файл слишком большой для подписанного MP4/PNG");
     const head = await readFile(tempPath);
-    const signedMp4 = tryParseSignedMp4(head, fileName);
-    if (signedMp4) return signedMp4;
     const signedPng = tryParseSignedPng(head, fileName);
     if (signedPng) return signedPng;
     const signedJpeg = tryParseSignedJpeg(head, fileName);
@@ -658,7 +869,12 @@ export async function extractPackageFromPath(tempPath: string, fileName: string)
   }
 
   const zipfile = await openZipFile(tempPath);
+  /* Мелкие записи — в память; видео — только отпечатком (videoDigest).
+     Поэтому состав пакета ведётся отдельным набором имён, а не ключами
+     буферов: видео в буферах нет. */
   const buffers = new Map<string, Buffer>();
+  const names = new Set<string>();
+  let videoDigest: { sha256Hex: string; size: number } | undefined;
   let entryCount = 0;
 
   await new Promise<void>((resolve, reject) => {
@@ -682,17 +898,19 @@ export async function extractPackageFromPath(tempPath: string, fileName: string)
       // выше — она читает оглавление напрямую и не верит заявленному числу
       // записей. Здесь дубль ловится только если его выдал сам разборщик;
       // проверка дешёвая, поэтому оставлена.
-      if (buffers.has(entry.fileName)) {
+      if (names.has(entry.fileName)) {
         reject(new PackageRejectedError(`Повторяющееся имя в архиве: ${entry.fileName}`));
         return;
       }
       // Абсолютный размер медиа внутри архива. Проверка степени сжатия
       // выше ловит «архивную бомбу», но не ловит честно несжатый файл:
-      // у него степень сжатия 1.0, и он проходил. А содержимое читается в
-      // память целиком — одна гигабайтная запись означала гигабайт в памяти
-      // процесса, то есть остановку проверки для всех остальных. Потолок тот
-      // же, что у отдельного подписанного медиа, чтобы правила не расходились.
-      if (MEDIA_ENTRIES.has(entry.fileName) && entry.uncompressedSize > MAX_SIGNED_MEDIA_BYTES) {
+      // у него степень сжатия 1.0, и он проходил. Фото читается в память
+      // целиком — одна гигабайтная запись означала бы гигабайт в памяти
+      // процесса. Видео идёт потоком в хэш, но и у него потолок есть: время
+      // проверки тоже ресурс. Потолки те же, что у отдельного подписанного
+      // медиа, чтобы правила не расходились.
+      const mediaCap = entry.fileName === "video.mp4" ? MAX_STREAMED_VIDEO_BYTES : MAX_SIGNED_MEDIA_BYTES;
+      if (MEDIA_ENTRIES.has(entry.fileName) && entry.uncompressedSize > mediaCap) {
         reject(new PackageRejectedError(`Медиафайл в архиве слишком большой: ${entry.fileName}`));
         return;
       }
@@ -717,6 +935,16 @@ export async function extractPackageFromPath(tempPath: string, fileName: string)
         reject(new PackageRejectedError("Журнал датчиков слишком большой"));
         return;
       }
+      names.add(entry.fileName);
+      if (entry.fileName === "video.mp4") {
+        hashEntryStream(zipfile, entry)
+          .then((d) => {
+            videoDigest = d;
+            zipfile.readEntry();
+          })
+          .catch(reject);
+        return;
+      }
       readEntryBuffer(zipfile, entry)
         .then((buf) => {
           buffers.set(entry.fileName, buf);
@@ -728,7 +956,7 @@ export async function extractPackageFromPath(tempPath: string, fileName: string)
   });
   zipfile.close();
 
-  const isPhoto = buffers.has("photo.png");
+  const isPhoto = names.has("photo.png");
   /* Настоящая съёмка — всегда либо фото, либо видео: пути, который положил
      бы в один пакет и то и другое, в приложении нет. Пакет с обоими может
      быть только собран руками — например, к честному проверенному фото
@@ -736,7 +964,7 @@ export async function extractPackageFromPath(tempPath: string, fileName: string)
      Раньше такое видео лежало здесь же, доступное для чтения, но его никто
      не смотрел: ветка по типу выбирала фото и на этом останавливалась.
      Отвергаем целиком, а не разбираем одно и молчим про другое. */
-  if (isPhoto && buffers.has("video.mp4")) {
+  if (isPhoto && names.has("video.mp4")) {
     throw new PackageRejectedError("Пакет содержит и photo.png, и video.mp4 — настоящая съёмка никогда не производит оба одновременно");
   }
   /* Набор допустимых имён зависит от типа пакета, а не общий на оба.
@@ -754,7 +982,7 @@ export async function extractPackageFromPath(tempPath: string, fileName: string)
      по другой причине — «в манифесте нет поля signature». Это отказ, но не
      тот: он прячет настоящую причину и открывает путь понижения формата.
      Поэтому: увидели хоть одну `.jws` — разбираем как 2.0 и требуем все. */
-  const jwsNames = [...buffers.keys()].filter((n) => JWS_ENTRIES.has(n));
+  const jwsNames = [...names].filter((n) => JWS_ENTRIES.has(n));
   const isV2 = jwsNames.length > 0;
   /* `sensors.bin` стоит в наборе только у 2.0 и только как разрешённая:
      здесь она может отсутствовать, не вызвав отказа. Файл 1.x её нести не
@@ -765,7 +993,7 @@ export async function extractPackageFromPath(tempPath: string, fileName: string)
     : (isV2 ? ["manifest_start.json", "manifest_start.json.jws",
                "manifest_end.json", "manifest_end.json.jws", "video.mp4", SENSORS_ENTRY]
             : ["manifest_start.json", "manifest_end.json", "video.mp4"]);
-  const strayNames = [...buffers.keys()].filter((n) => expected.indexOf(n) < 0);
+  const strayNames = [...names].filter((n) => expected.indexOf(n) < 0);
   if (strayNames.length) {
     throw new PackageRejectedError(
       "Пакет содержит посторонние файлы: " + strayNames.join(", ") +
@@ -778,7 +1006,7 @@ export async function extractPackageFromPath(tempPath: string, fileName: string)
      проверки видеопакет с одной подписью дошёл бы до проверки вердикта. */
   if (isV2) {
     for (const name of expected.filter((n) => JWS_ENTRIES.has(n))) {
-      if (!buffers.has(name)) {
+      if (!names.has(name)) {
         throw new PackageRejectedError("В пакете нет записи подписи " + name);
       }
     }
@@ -802,8 +1030,7 @@ export async function extractPackageFromPath(tempPath: string, fileName: string)
   }
   const manifestStart = buffers.get("manifest_start.json");
   const manifestEnd = buffers.get("manifest_end.json");
-  const videoBuffer = buffers.get("video.mp4");
-  if (!manifestStart || !manifestEnd || !videoBuffer)
+  if (!manifestStart || !manifestEnd || !videoDigest)
     throw new PackageRejectedError("Пакет не содержит manifest_start.json, manifest_end.json и video.mp4 вместе");
   return {
     fileName,
@@ -814,6 +1041,6 @@ export async function extractPackageFromPath(tempPath: string, fileName: string)
     manifestStartJwsBytes: isV2 ? new Uint8Array(buffers.get("manifest_start.json.jws")!) : undefined,
     manifestEndJwsBytes: isV2 ? new Uint8Array(buffers.get("manifest_end.json.jws")!) : undefined,
     sensorLogBytes: sensorLog,
-    videoBuffer: toArrayBuffer(videoBuffer),
+    videoDigest,
   };
 }
