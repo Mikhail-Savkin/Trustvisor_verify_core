@@ -17,7 +17,7 @@
 // туда попадает, только если проверка сочла его подлинным. «Портал» — сервер,
 // который эту проверку выполняет.
 import type { webcrypto } from "node:crypto";
-import { GOOGLE_ROOT_FINGERPRINTS_HARDCODED, OEM_ROOT_FINGERPRINTS, TRUSTVISOR_ATTESTATION_PUBLIC_KEY_B64, TRUSTVISOR_WEB_SIGNING_KEYS } from "./trusted-roots.js";
+import { GOOGLE_ROOT_FINGERPRINTS_HARDCODED, OEM_ROOT_FINGERPRINTS, TRUSTVISOR_ATTESTATION_PUBLIC_KEY_B64, TRUSTVISOR_ATTESTATION_PUBLIC_KEY_NEXT_B64, TRUSTVISOR_ATTESTATION_OLD_KEY_LAST_EXP_MS, TRUSTVISOR_WEB_SIGNING_KEYS } from "./trusted-roots.js";
 import { REVOKED_SERIALS, REVOKED_SNAPSHOT_DATE } from "./revoked-keys.js";
 import { PackageRejectedError } from "./errors.js";
 export { PackageRejectedError } from "./errors.js";
@@ -1690,12 +1690,21 @@ export async function checkAttestationChallengeFreshness(
   }
 
   let sigOk = false;
-  try {
-    const pubKey = await importSpkiKey(TRUSTVISOR_ATTESTATION_PUBLIC_KEY_B64);
-    const payload = new TextEncoder().encode(`${ext.challenge}.${expMs}`);
-    sigOk = await crypto.subtle.verify({ name: "ECDSA", hash: { name: "SHA-256" } }, pubKey, derToP1363(base64ToBytes(sigB64)) as BufferSource, payload as BufferSource);
-  } catch {
-    sigOk = false;
+  const payload = new TextEncoder().encode(`${ext.challenge}.${expMs}`);
+  /* Нынешний ключ — всегда; прежний — только для токенов, выданных до его
+     замены (см. TRUSTVISOR_ATTESTATION_OLD_KEY_LAST_EXP_MS). */
+  const keysToTry = [TRUSTVISOR_ATTESTATION_PUBLIC_KEY_NEXT_B64];
+  if (expMs <= TRUSTVISOR_ATTESTATION_OLD_KEY_LAST_EXP_MS) keysToTry.push(TRUSTVISOR_ATTESTATION_PUBLIC_KEY_B64);
+  for (const keyB64 of keysToTry) {
+    try {
+      const pubKey = await importSpkiKey(keyB64);
+      if (await crypto.subtle.verify({ name: "ECDSA", hash: { name: "SHA-256" } }, pubKey, derToP1363(base64ToBytes(sigB64)) as BufferSource, payload as BufferSource)) {
+        sigOk = true;
+        break;
+      }
+    } catch {
+      /* следующий ключ */
+    }
   }
   if (!sigOk) return { state: "fail", msg: "Подпись сервера для challenge не подтверждена — возможна подделка" };
 

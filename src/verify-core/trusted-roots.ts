@@ -49,8 +49,18 @@ export const OEM_ROOT_FINGERPRINTS = [
    Список, а не одно значение, — чтобы ключ можно было сменить, не ломая
    ранее выданные файлы: старый `kid` остаётся, новые пакеты идут с новым. */
 export const TRUSTVISOR_WEB_SIGNING_KEYS: Record<string, string> = {
-  /* "tv-web-1": "<base64 SPKI>", — заполняется при заведении ключа */
+  "tv-web-1": "MFkwEwYHKoZIzj0CAQYIKoZIzj0DAQcDQgAEcHIWP9QJk4mUtztdwyiAvDUz91vGIzCD3hgG79WMzigrn5Hqxs3zd0xgYwm9j6mns+5R9mXP8Hham4E31gIUNg==",
 };
 
 export const TRUSTVISOR_ATTESTATION_PUBLIC_KEY_B64 =
   "MFkwEwYHKoZIzj0CAQYIKoZIzj0DAQcDQgAENm8hzLLHTRalN6RmceYJt0eA8GsrU1qojRITpC3sCmFNdgl0FWaKajdcgW2s7bdrjOWPeJJYGXapnb2G18Cs8A==";
+
+/* Замена ключа подтверждения момента, начата 28.09.2026. Новый ключ
+   принимается всегда; прежний (выше) — для токенов со сроком не позже
+   TRUSTVISOR_ATTESTATION_OLD_KEY_LAST_EXP_MS. Пока сервер подписывает
+   прежним, отсечки нет. Когда перейдёт на новый — сюда ставится срок
+   последнего токена прежнего ключа: уже снятые файлы останутся
+   подлинными, а позже прежним ключом токен не подделать. */
+export const TRUSTVISOR_ATTESTATION_PUBLIC_KEY_NEXT_B64 =
+  "MFkwEwYHKoZIzj0CAQYIKoZIzj0DAQcDQgAEh4xy+MxJXELKcaOddckf+QtcPqLoblq4CRJ+KOe/Nywty/Wmbkys6EN36DxxfEDamcY+gp69HMwoxei4hEknIw==";
+export const TRUSTVISOR_ATTESTATION_OLD_KEY_LAST_EXP_MS = Number.MAX_SAFE_INTEGER; /* отсечки пока нет */

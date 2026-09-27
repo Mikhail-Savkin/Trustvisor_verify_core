@@ -1,6 +1,6 @@
 {
   "name": "trustvisor-verify-core",
-  "version": "1.4.0",
+  "version": "1.5.0",
   "description": "Ядро проверки подлинности файлов TrustVisor: разбор пакета, сверка подписи, цепочка аппаратной аттестации, вердикт.",
   "type": "module",
   "engines": {
