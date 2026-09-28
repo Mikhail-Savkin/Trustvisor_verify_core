@@ -57,10 +57,10 @@ export const TRUSTVISOR_ATTESTATION_PUBLIC_KEY_B64 =
 
 /* Замена ключа подтверждения момента, начата 28.09.2026. Новый ключ
    принимается всегда; прежний (выше) — для токенов со сроком не позже
-   TRUSTVISOR_ATTESTATION_OLD_KEY_LAST_EXP_MS. Пока сервер подписывает
-   прежним, отсечки нет. Когда перейдёт на новый — сюда ставится срок
-   последнего токена прежнего ключа: уже снятые файлы останутся
+   TRUSTVISOR_ATTESTATION_OLD_KEY_LAST_EXP_MS. Сервер перешёл на новый
+   ключ 28.09.2026 в 00:56 UTC; отсечка — срок последнего токена прежнего
+   ключа (срок токена не больше суток): уже снятые файлы остаются
    подлинными, а позже прежним ключом токен не подделать. */
 export const TRUSTVISOR_ATTESTATION_PUBLIC_KEY_NEXT_B64 =
   "MFkwEwYHKoZIzj0CAQYIKoZIzj0DAQcDQgAEh4xy+MxJXELKcaOddckf+QtcPqLoblq4CRJ+KOe/Nywty/Wmbkys6EN36DxxfEDamcY+gp69HMwoxei4hEknIw==";
-export const TRUSTVISOR_ATTESTATION_OLD_KEY_LAST_EXP_MS = Number.MAX_SAFE_INTEGER; /* отсечки пока нет */
+export const TRUSTVISOR_ATTESTATION_OLD_KEY_LAST_EXP_MS = Date.UTC(2026, 8, 29, 1, 0, 0); /* 29.09.2026 04:00 МСК */
